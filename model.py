@@ -79,9 +79,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, config.expansion_factor * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(config.expansion_factor * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -120,6 +120,7 @@ class GPTConfig:
     max_router_iter: int = 6
     open_choice: bool = False
     weigh_experts: bool = True
+    expansion_factor: int = 4
 
 class GPT(nn.Module):
 
@@ -353,9 +354,11 @@ class GW_GPT(GPT):
         super().__init__(config)
 
         self.router_proj_size = config.n_layer if config.open_choice else config.expert_k
+        if config.meta_controller:
+            self.router_proj_size += 1
 
         self.transformer["router"] = nn.LSTM(
-            input_size=config.block_size * config.n_embd, 
+            input_size=config.block_size * config.n_embd,
             hidden_size=config.LSTM_hidden_size, 
             num_layers=config.n_LSTM_layer, 
             dropout=config.dropout
@@ -376,11 +379,7 @@ class GW_GPT(GPT):
     def forward(self, idx, targets=None):
         x = self.pre_blocks_forward(idx, targets)
         router_state = None
-        i = 0
-
-        # Initialize the LSTM hidden state
-        self.router_proj_size = self.config.n_layer if self.config.open_choice else self.config.expert_k
-        
+        i = 0        
 
 
         while i < self.config.max_router_iter:

@@ -40,7 +40,7 @@ import wandb
 
 
 
-def objective(run_config, seed=None, out_dir=None):
+def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
 
     config = {}
 
@@ -131,16 +131,23 @@ def objective(run_config, seed=None, out_dir=None):
     config["wandb_log"] = True
     config["expert_k"] = 2
 
-    if run_config["condition"] in ["Transformer", "Big-Transformer"]:
-        config["model_cls"] = GPT
-    else:
-        config["model_cls"] = GW_GPT
-    if run_config["condition"] == "Big-Transformer":
-        config["n_layer"] = run_config["n_layer"] * 2
+    
+    config["model_cls"] = GPT if "Transformer" in run_config["condition"] else GW_GPT
+    config["expansion_factor"] = 8 if "2xFF" in run_config["condition"] else 4
+    config["n_embd"] = config["n_embd"] * 2 if "2n_embd" in run_config["condition"] else config["n_embd"]
+    config["n_head"] = config["n_head"] * 2 if "2n_head" in run_config["condition"] else config["n_head"]
+
+        
+    # if run_config["condition"] == "Big-Transformer":
+    #     config["n_layer"] = run_config["n_layer"] * 2
     config["open_choice"] = run_config["condition"] == "Ours"
     config["weigh_experts"] = not run_config["condition"] == "Double"
     
     config["max_router_iter"] = config["n_layer"] // config["expert_k"]
+
+    if run_config["condition"] == "Ours-2xT":
+        config["max_router_iter"] = config["max_router_iter"] * 2
+
 
     # # fast debugging
     # torch.autograd.set_detect_anomaly(True)
@@ -175,7 +182,7 @@ def objective(run_config, seed=None, out_dir=None):
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
     if master_process:
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(config["out_dir"], exist_ok=True)
     if seed is not None:
         torch.manual_seed(seed + seed_offset)
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -304,7 +311,7 @@ def objective(run_config, seed=None, out_dir=None):
             if losses['val'] < best_val_loss or config["always_save_checkpoint"]:
                 best_val_loss = losses['val']
                 # done_when = done_whens['val']
-                if iter_num > 0:
+                if iter_num > 0 and save_checkpoint:
                     checkpoint = {
                         'model': raw_model.state_dict(),
                         'optimizer': optimizer.state_dict(),

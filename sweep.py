@@ -22,7 +22,16 @@ run_configuration = {
         #     "values": [True], # [True, False],
         # },
         'condition': {
-            "values": ["Transformer", "Big-Transformer", "Double", "w-Double", "Ours"],
+            "values": [
+                "Transformer", 
+                "Transformer-2xFF", 
+                "Transformer-2n_embd", 
+                "Transformer-2n_head-2n_embd",
+                "Double", 
+                "w-Double", 
+                "Ours", 
+                "Ours-2xT"
+            ],
         },
         'n_layer': {
             "values": [6], # [2, 4, 6, 8, 10],
@@ -37,13 +46,13 @@ def main():
         sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
     )
     # loss, done_when = objective(wandb.config)
-    loss = objective(wandb.config)
+    loss = objective(wandb.config, save_checkpoint=False)
     wandb.log({"loss": loss})
     # wandb.log({"done_when": done_when})
 
 
 if __name__ == "__main__":
-    sweep_id = [None, "vny6egfq"][-1]
+    sweep_id = [None, "uhwxos70"][-1]
     if sweep_id is None:
         sweep_id = wandb.sweep(sweep=run_configuration, project="shakespeare-char")
     count = 1e4
