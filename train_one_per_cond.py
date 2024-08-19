@@ -19,7 +19,7 @@ def main():
     # Launch one run per condition
     for condition in conditions:
         config = {"condition": condition, "n_layer": 6}
-        run = wandb.init(project="shakespeare-char", config=config)
+        run = wandb.init(project="GW_LLM", config=config)
         run_config = wandb.config
         best_val_loss = objective(run_config, seed=42, out_dir="out-shakespeare-char-"+condition)
         run.log({"best_val_loss": best_val_loss})

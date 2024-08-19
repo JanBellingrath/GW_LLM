@@ -31,7 +31,7 @@ from model import GPTConfig, GPT, GW_GPT
 
 # the following part ensures that only ONE GPU is seen
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # DEVICE = "cpu"
@@ -96,7 +96,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     config["always_save_checkpoint"] = False
 
     config["wandb_log"] = False # override via command line if you like
-    config["wandb_project"] = 'shakespeare-char'
+    config["wandb_project"] = 'GW_LLM'
     config["wandb_run_name"] = 'mini-gpt'
 
     config["dataset"] = 'shakespeare_char'
@@ -123,14 +123,24 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     config["log_interval"] = 10
     config["block_size"] = 256
     config["batch_size"] = 64
-    config["n_head"] = 6
-    config["n_embd"] = 384
     config["max_iters"] = 5000
     config["lr_decay_iters"] = 5000
     config["dropout"] = 0.2
-    config["wandb_log"] = True
     config["expert_k"] = 2
 
+    # config["n_head"] = 6
+    # config["n_embd"] = 384
+
+    # Hyperparameter search
+    config["n_layer"] = run_config["n_layer"]
+    config["n_head"] = run_config["n_head"]
+    config["n_embd"] = run_config["n_embd"]
+    config["dropout"] = run_config["dropout"]
+    config["learning_rate"] = run_config["learning_rate"]
+    config["min_lr"] = config["learning_rate"] / 10
+
+    config["wandb_log"] = True
+    config["dataset"] = 'babyLM_train_10M'
     
     config["model_cls"] = GPT if "Transformer" in run_config["condition"] else GW_GPT
     config["expansion_factor"] = 8 if "2xFF" in run_config["condition"] else 4
@@ -140,13 +150,20 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
         
     # if run_config["condition"] == "Big-Transformer":
     #     config["n_layer"] = run_config["n_layer"] * 2
-    config["open_choice"] = run_config["condition"] == "Ours"
+    config["open_choice"] = "Ours" in run_config["condition"]
     config["weigh_experts"] = not run_config["condition"] == "Double"
     
     config["max_router_iter"] = config["n_layer"] // config["expert_k"]
 
     if run_config["condition"] == "Ours-2xT":
         config["max_router_iter"] = config["max_router_iter"] * 2
+
+    if "ACT" in run_config["condition"]:
+        config["max_router_iter"] = 25
+        config["meta_controller"] = True
+    else:
+        config["meta_controller"] = False
+
 
 
     # # fast debugging
@@ -226,7 +243,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
 
     # model init
     model_args = dict(n_layer=config["n_layer"], max_router_iter=config["max_router_iter"], expert_k=config["expert_k"], open_choice=config["open_choice"], weigh_experts=config["weigh_experts"], n_head=config["n_head"], n_embd=config["n_embd"], block_size=config["block_size"],
-                    bias=config["bias"], vocab_size=None, dropout=config["dropout"]) # start with model_args from command line
+                    bias=config["bias"], vocab_size=None, dropout=config["dropout"], expansion_factor=config["expansion_factor"], meta_controller=config["meta_controller"])
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
@@ -307,7 +324,14 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
             # losses, done_whens = estimate_loss()
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            
+            if config["wandb_log"]:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
             if losses['val'] < best_val_loss or config["always_save_checkpoint"]:
                 best_val_loss = losses['val']
                 # done_when = done_whens['val']

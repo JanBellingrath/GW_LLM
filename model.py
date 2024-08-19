@@ -121,6 +121,7 @@ class GPTConfig:
     open_choice: bool = False
     weigh_experts: bool = True
     expansion_factor: int = 4
+    meta_controller: bool = False
 
 class GPT(nn.Module):
 
@@ -187,11 +188,19 @@ class GPT(nn.Module):
         
         return x
     
-    def post_blocks_forward(self, x, targets=None):
+    def post_blocks_forward(self, x, targets=None, intermediate_outputs=None):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if intermediate_outputs is None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                # calculate loss for each intermediate output
+                loss = 0
+                for i, output in enumerate(intermediate_outputs):
+                    intermediate_logits = self.lm_head(output)
+                    loss += F.cross_entropy(intermediate_logits.view(-1, intermediate_logits.size(-1)), targets.view(-1), ignore_index=-1)
+                loss /= len(intermediate_outputs)
 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -353,7 +362,16 @@ class GW_GPT(GPT):
     def __init__(self, config):
         super().__init__(config)
 
-        self.router_proj_size = config.n_layer if config.open_choice else config.expert_k
+        if config.open_choice:
+            self.router_proj_size = config.n_layer
+            if config.identity_lauyers:
+                self.router_proj_size += config.expert_k # Add enough identity layers to match the number of experts
+        else:
+            self.router_proj_size = config.expert_k
+            if config.identity_lauyers:
+                assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
+                self.router_proj_size += config.n_layer // config.expert_k # Add one identity layer per step
+
         if config.meta_controller:
             self.router_proj_size += 1
 
@@ -369,25 +387,35 @@ class GW_GPT(GPT):
         # Predetermine block groups for each time step if open_choice is False
         if not config.open_choice:
 
-            print(config.expert_k, config.n_layer, config.max_router_iter)
             assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
-            assert config.n_layer / config.expert_k == config.max_router_iter, (
-                "max_router_iter must be equal to the total number of layers divided by the number of experts per step."
-            )
+            assert not config.identity_lauyers, "Identity layers are not yet supported with closed choice."
             self.block_groups = [list(range(i, i + config.expert_k)) for i in range(0, config.n_layer, config.expert_k)]
         
     def forward(self, idx, targets=None):
         x = self.pre_blocks_forward(idx, targets)
         router_state = None
-        i = 0        
+        i = 0      
+
+        if self.config.meta_controller:
+            outputs = []
+            output = torch.zeros_like(x)  
 
 
         while i < self.config.max_router_iter:
+
+
             # Dynamic expert selection
             padding = torch.zeros(x.shape[0], self.config.block_size - x.shape[1], x.shape[2]).to(x.device).to(x.dtype)
             x = torch.cat((padding, x), dim=1)
+
             router_logits, router_state = self.transformer["router"](x.reshape(1, x.shape[0], -1), router_state)
             router_logits = self.router_linear(router_logits.squeeze(0))
+
+            if self.config.meta_controller:
+                router_logits = router_logits[:, :-1]
+                done = torch.sigmoid(router_logits[:, -1])
+                output = output * (1 - done.view(-1, 1, 1))
+
             routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
 
             if self.config.open_choice:
@@ -398,7 +426,8 @@ class GW_GPT(GPT):
                 # Cast back to the input dtype
                 routing_weights = routing_weights.to(x.dtype)
 
-                final_x = torch.zeros_like(x)
+                if not self.config.meta_controller:
+                    output = torch.zeros_like(x)
 
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer).permute(2, 0, 1).to(x.device)
                 
@@ -415,17 +444,21 @@ class GW_GPT(GPT):
 
                         # Ensure the selected_routing_weights is broadcastable to current_x
                         selected_routing_weights = selected_routing_weights.view(-1, 1, 1)
-                        current_x = current_x * selected_routing_weights
+                        current_x = current_x * selected_routing_weights 
+
+                        if self.config.meta_controller:
+                            current_x = current_x * done[index].view(-1, 1, 1)
 
                         # Accumulate the outputs
-                        final_x.index_add_(0, index, current_x.to(x.dtype))
+                        output.index_add_(0, index, current_x.to(x.dtype))
 
             else:
                
                 # Cast back to the input dtype
                 routing_weights = routing_weights.to(x.dtype)
 
-                final_x = torch.zeros_like(x)
+                if not self.config.meta_controller:
+                    output = torch.zeros_like(x)
                 
                 for expert_i, expert_idx in enumerate(range(i * self.config.expert_k, (i + 1) * self.config.expert_k)):
 
@@ -437,20 +470,21 @@ class GW_GPT(GPT):
                     else:
                         current_x = current_x / self.config.expert_k # Average the outputs
 
+                    if self.config.meta_controller:
+                        current_x = current_x * done.view(-1, 1, 1)
+
                     # Accumulate the outputs
-                    final_x += current_x
+                    output += current_x
 
-            x = final_x
-
-            
+            x = output
+            if self.config.meta_controller:
+                outputs.append(self.transformer.ln_f(output))
 
             i += 1
 
-            
-
         x = self.transformer.ln_f(x)
-
-        logits, loss = self.post_blocks_forward(x, targets)
+        
+        logits, loss = self.post_blocks_forward(x, targets, intermediate_outputs=outputs if self.config.meta_controller else None)
 
         return logits, loss
     
@@ -512,7 +546,7 @@ class GW_GPT(GPT):
 #                 # Cast back to the input dtype
 #                 routing_weights = routing_weights.to(x.dtype)
 
-#                 final_x = torch.zeros_like(x[~done])
+#                 output = torch.zeros_like(x[~done])
 
 #                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer).permute(2, 0, 1).to(x.device)
                 
@@ -532,14 +566,14 @@ class GW_GPT(GPT):
 #                         current_x = current_x * selected_routing_weights
 
 #                         # Accumulate the outputs
-#                         final_x.index_add_(0, index, current_x.to(x.dtype))
+#                         output.index_add_(0, index, current_x.to(x.dtype))
 
 #             else:
                
 #                 # Cast back to the input dtype
 #                 routing_weights = routing_weights.to(x.dtype)
 
-#                 final_x = torch.zeros_like(x[~done])
+#                 output = torch.zeros_like(x[~done])
                 
 #                 for expert_i, expert_idx in enumerate(range(i * self.config.expert_k, (i + 1) * self.config.expert_k)):
 
@@ -549,9 +583,9 @@ class GW_GPT(GPT):
 #                     current_x = current_x * routing_weights[:, expert_i].view(-1, 1, 1)
 
 #                     # Accumulate the outputs
-#                     final_x += current_x
+#                     output += current_x
 
-#             x[~done] = final_x
+#             x[~done] = output
 
 #             if self.config.sample_done:
 #                 # The last dimension of the router is the output gate which determines the probability of the sequence being done
