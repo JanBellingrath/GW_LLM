@@ -13,10 +13,10 @@
         - [x] lancer opt
         - [ ] générations pire et meilleur config
     - [ ] before further ours
-        - [ ] optimize D_router
-        - [ ] k couches identité (en plus des n layers)
-        - [ ] T max avant ACT
-            - [ ] opt en loss cumulée et test au dernier t
+        - [x] optimize D_router
+        - [x] k couches identité (en plus des n layers)
+        - [x] T max avant ACT
+            - [x] opt en loss cumulée et test au dernier t
     - [ ] analyses
         - [ ] does adding identity layers help?
         - [ ] ours vs transformer
@@ -27,4 +27,5 @@
                 - [ ] mat layer/layer2
             - [ ] are identity layers used? When?
         - [ ] validation pipeline
+    - [ ] régularisation des experts ?
     

@@ -121,7 +121,8 @@ class GPTConfig:
     open_choice: bool = False
     weigh_experts: bool = True
     expansion_factor: int = 4
-    meta_controller: bool = False
+    intermediate_outputs_training: bool = False
+    identity_layers: bool = False
 
 class GPT(nn.Module):
 
@@ -189,13 +190,14 @@ class GPT(nn.Module):
         return x
     
     def post_blocks_forward(self, x, targets=None, intermediate_outputs=None):
+
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            if intermediate_outputs is None:
+            if not self.config.intermediate_outputs_training or intermediate_outputs is None or not self.training:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             else:
-                # calculate loss for each intermediate output
+                # calculate loss for each intermediate output if available and training
                 loss = 0
                 for i, output in enumerate(intermediate_outputs):
                     intermediate_logits = self.lm_head(output)
@@ -364,16 +366,12 @@ class GW_GPT(GPT):
 
         if config.open_choice:
             self.router_proj_size = config.n_layer
-            if config.identity_lauyers:
+            if config.identity_layers:
                 self.router_proj_size += config.expert_k # Add enough identity layers to match the number of experts
         else:
             self.router_proj_size = config.expert_k
-            if config.identity_lauyers:
-                assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
-                self.router_proj_size += config.n_layer // config.expert_k # Add one identity layer per step
-
-        if config.meta_controller:
-            self.router_proj_size += 1
+            if config.identity_layers:
+                self.router_proj_size += 1 # Add an identity layer that will be used at each step
 
         self.transformer["router"] = nn.LSTM(
             input_size=config.block_size * config.n_embd,
@@ -386,23 +384,18 @@ class GW_GPT(GPT):
 
         # Predetermine block groups for each time step if open_choice is False
         if not config.open_choice:
-
             assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
-            assert not config.identity_lauyers, "Identity layers are not yet supported with closed choice."
             self.block_groups = [list(range(i, i + config.expert_k)) for i in range(0, config.n_layer, config.expert_k)]
         
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_router_logits=False):
         x = self.pre_blocks_forward(idx, targets)
         router_state = None
         i = 0      
 
-        if self.config.meta_controller:
-            outputs = []
-            output = torch.zeros_like(x)  
-
+        outputs = []
+        router_logits_list = []
 
         while i < self.config.max_router_iter:
-
 
             # Dynamic expert selection
             padding = torch.zeros(x.shape[0], self.config.block_size - x.shape[1], x.shape[2]).to(x.device).to(x.dtype)
@@ -411,43 +404,38 @@ class GW_GPT(GPT):
             router_logits, router_state = self.transformer["router"](x.reshape(1, x.shape[0], -1), router_state)
             router_logits = self.router_linear(router_logits.squeeze(0))
 
-            if self.config.meta_controller:
-                router_logits = router_logits[:, :-1]
-                done = torch.sigmoid(router_logits[:, -1])
-                output = output * (1 - done.view(-1, 1, 1))
-
             routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+
 
             if self.config.open_choice:
                 assert self.config.weigh_experts, "Open choice requires weighing the experts."
                 routing_weights, selected_experts = torch.topk(routing_weights, self.config.expert_k, dim=-1)
+
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
 
                 # Cast back to the input dtype
                 routing_weights = routing_weights.to(x.dtype)
 
-                if not self.config.meta_controller:
-                    output = torch.zeros_like(x)
+                output = torch.zeros_like(x)
 
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer).permute(2, 0, 1).to(x.device)
+                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)).permute(2, 0, 1).to(x.device)
                 
                 # Loop over all available experts in the model and perform the computation on each expert
-                for expert_idx in range(self.config.n_layer):
+                for expert_idx in range(self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)):
 
-                    expert_layer = self.transformer.h[expert_idx]
+                    expert_layer = None if expert_idx >= self.config.n_layer and self.config.identity_layers else self.transformer.h[expert_idx]
 
                     index = torch.where(expert_mask[expert_idx])[0]
 
                     if len(index) > 0:
-                        current_x = expert_layer(x[index])
+                        
+                        current_x = expert_layer(x[index]) if expert_layer is not None else x[index]
                         selected_routing_weights = routing_weights[index, expert_mask[expert_idx].nonzero(as_tuple=True)[1]]
 
                         # Ensure the selected_routing_weights is broadcastable to current_x
                         selected_routing_weights = selected_routing_weights.view(-1, 1, 1)
                         current_x = current_x * selected_routing_weights 
-
-                        if self.config.meta_controller:
-                            current_x = current_x * done[index].view(-1, 1, 1)
 
                         # Accumulate the outputs
                         output.index_add_(0, index, current_x.to(x.dtype))
@@ -457,147 +445,35 @@ class GW_GPT(GPT):
                 # Cast back to the input dtype
                 routing_weights = routing_weights.to(x.dtype)
 
-                if not self.config.meta_controller:
-                    output = torch.zeros_like(x)
+                output = torch.zeros_like(x)
                 
-                for expert_i, expert_idx in enumerate(range(i * self.config.expert_k, (i + 1) * self.config.expert_k)):
+                for expert_i, expert_idx in enumerate(range(i * (self.config.expert_k + (1 if self.config.identity_layers else 0)), (i + 1) * (self.config.expert_k + (1 if self.config.identity_layers else 0)))):
 
-                    expert_layer = self.transformer.h[expert_idx]
-
-                    current_x = expert_layer(x)
+                    if self.config.identity_layers and expert_i == self.config.expert_k:
+                        current_x = x
+                    else:
+                        expert_layer = self.transformer.h[expert_idx]
+                        current_x = expert_layer(x)
                     if self.config.weigh_experts:
                         current_x = current_x * routing_weights[:, expert_i].view(-1, 1, 1) # Weight the outputs
                     else:
-                        current_x = current_x / self.config.expert_k # Average the outputs
-
-                    if self.config.meta_controller:
-                        current_x = current_x * done.view(-1, 1, 1)
+                        current_x = current_x / (self.config.expert_k + (1 if self.config.identity_layers else 0)) # Average the outputs
 
                     # Accumulate the outputs
                     output += current_x
 
             x = output
-            if self.config.meta_controller:
-                outputs.append(self.transformer.ln_f(output))
+            outputs.append(self.transformer.ln_f(output))
+            if return_router_logits:
+                router_logits_list.append(router_logits)
 
             i += 1
 
         x = self.transformer.ln_f(x)
         
-        logits, loss = self.post_blocks_forward(x, targets, intermediate_outputs=outputs if self.config.meta_controller else None)
+        logits, loss = self.post_blocks_forward(x, targets, intermediate_outputs=outputs)
 
-        return logits, loss
-    
-
-# class Adaptive_GW_GPT(GPT):
-
-#     def __init__(self, config):
-#         super().__init__(config)
-
-#         self.router_proj_size = config.n_layer if config.open_choice else config.expert_k
-
-#         self.transformer["router"] = nn.LSTM(
-#             input_size=config.block_size * config.n_embd, 
-#             hidden_size=config.LSTM_hidden_size, 
-#             num_layers=config.n_LSTM_layer, 
-#             dropout=config.dropout
-#         )
-
-#         self.router_linear = nn.Linear(config.LSTM_hidden_size, self.router_proj_size)
-
-#         # Predetermine block groups for each time step if open_choice is False
-#         if not config.open_choice:
-
-#             print(config.expert_k, config.n_layer, config.max_router_iter)
-#             assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
-#             assert config.n_layer / config.expert_k == config.max_router_iter, (
-#                 "max_router_iter must be equal to the total number of layers divided by the number of experts per step."
-#             )
-#             self.block_groups = [list(range(i, i + config.expert_k)) for i in range(0, config.n_layer, config.expert_k)]
-        
-#     def forward(self, idx, targets=None):
-#         x = self.pre_blocks_forward(idx, targets)
-#         router_state = None
-#         i = 0
-
-#         # Initialize the LSTM hidden state
-#         self.router_proj_size = self.config.n_layer if self.config.open_choice else self.config.expert_k
-#         h = torch.zeros(self.config.n_LSTM_layer, x.shape[0], self.config.LSTM_hidden_size).to(x.device).to(x.dtype)
-#         c = torch.zeros(self.config.n_LSTM_layer, x.shape[0], self.config.LSTM_hidden_size).to(x.device).to(x.dtype)
-#         done_when = torch.zeros(x.shape[0], dtype=torch.int).to(x.device) + self.config.max_router_iter
-        
-#         done = torch.zeros(x.shape[0], dtype=torch.bool).to(x.device)
-
-
-#         while i < self.config.max_router_iter and not done.all():
-#             # Dynamic expert selection
-#             router_logits, router_state = self.transformer["router"](x[~done].reshape(1, x[~done].shape[0], -1), (h[:,~done], c[:,~done]))
-#             h[:,~done], c[:,~done] = router_state[0].float(), router_state[1].float()
-#             router_logits = self.router_linear(router_logits.squeeze(0))
-#             routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
-
-#             if self.config.sample_done:
-#                 routing_weights = routing_weights[:, :-1]
-
-#             if self.config.open_choice:
-#                 routing_weights, selected_experts = torch.topk(routing_weights, self.config.expert_k, dim=-1)
-#                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-#                 # Cast back to the input dtype
-#                 routing_weights = routing_weights.to(x.dtype)
-
-#                 output = torch.zeros_like(x[~done])
-
-#                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer).permute(2, 0, 1).to(x.device)
-                
-#                 # Loop over all available experts in the model and perform the computation on each expert
-#                 for expert_idx in range(self.config.n_layer):
-
-#                     expert_layer = self.transformer.h[expert_idx]
-
-#                     index = torch.where(expert_mask[expert_idx])[0]
-
-#                     if len(index) > 0:
-#                         current_x = expert_layer(x[~done][index])
-#                         selected_routing_weights = routing_weights[index, expert_mask[expert_idx].nonzero(as_tuple=True)[1]]
-
-#                         # Ensure the selected_routing_weights is broadcastable to current_x
-#                         selected_routing_weights = selected_routing_weights.view(-1, 1, 1)
-#                         current_x = current_x * selected_routing_weights
-
-#                         # Accumulate the outputs
-#                         output.index_add_(0, index, current_x.to(x.dtype))
-
-#             else:
-               
-#                 # Cast back to the input dtype
-#                 routing_weights = routing_weights.to(x.dtype)
-
-#                 output = torch.zeros_like(x[~done])
-                
-#                 for expert_i, expert_idx in enumerate(range(i * self.config.expert_k, (i + 1) * self.config.expert_k)):
-
-#                     expert_layer = self.transformer.h[expert_idx]
-
-#                     current_x = expert_layer(x[~done])
-#                     current_x = current_x * routing_weights[:, expert_i].view(-1, 1, 1)
-
-#                     # Accumulate the outputs
-#                     output += current_x
-
-#             x[~done] = output
-
-#             if self.config.sample_done:
-#                 # The last dimension of the router is the output gate which determines the probability of the sequence being done
-#                 done[~done] = torch.bernoulli(routing_weights[:, -1]).bool()
-#                 done_when[~done] = i
-
-#             i += 1
-
-            
-
-#         x = self.transformer.ln_f(x)
-
-#         logits, loss = self.post_blocks_forward(x, targets)
-
-#         return logits, loss, torch.mean(done_when.float())
+        if return_router_logits:
+            return logits, loss, router_logits_list
+        else:
+            return logits, loss

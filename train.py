@@ -131,13 +131,17 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     # config["n_head"] = 6
     # config["n_embd"] = 384
 
-    # Hyperparameter search
-    config["n_layer"] = run_config["n_layer"]
-    config["n_head"] = run_config["n_head"]
-    config["n_embd"] = run_config["n_embd"]
-    config["dropout"] = run_config["dropout"]
-    config["learning_rate"] = run_config["learning_rate"]
-    config["min_lr"] = config["learning_rate"] / 10
+    # Replace the default config values with the ones from the sweep
+    config["n_layer"] = run_config["n_layer"] if "n_layer" in run_config else config["n_layer"]
+    config["n_head"] = run_config["n_head"] if "n_head" in run_config else config["n_head"]
+    config["n_embd"] = run_config["n_embd"] if "n_embd" in run_config else config["n_embd"]
+    config["dropout"] = run_config["dropout"] if "dropout" in run_config else config["dropout"]
+    if "learning_rate" in run_config:
+        config["learning_rate"] = run_config["learning_rate"] 
+        config["min_lr"] = config["learning_rate"] / 10
+    config["max_iters"] = run_config["max_iters"] if "max_iters" in run_config else config["max_iters"]
+    config["intermediate_outputs_training"] = run_config["intermediate_outputs_training"] if "intermediate_outputs_training" in run_config else False
+    config["max_router_iter"] = config["n_layer"] // config["expert_k"] if 'max_router_iter' not in run_config else run_config["max_router_iter"]
 
     config["wandb_log"] = True
     config["dataset"] = 'babyLM_train_10M'
@@ -146,6 +150,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     config["expansion_factor"] = 8 if "2xFF" in run_config["condition"] else 4
     config["n_embd"] = config["n_embd"] * 2 if "2n_embd" in run_config["condition"] else config["n_embd"]
     config["n_head"] = config["n_head"] * 2 if "2n_head" in run_config["condition"] else config["n_head"]
+    config["identity_layers"] = "no_ID" not in run_config["condition"]
 
         
     # if run_config["condition"] == "Big-Transformer":
@@ -153,17 +158,9 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     config["open_choice"] = "Ours" in run_config["condition"]
     config["weigh_experts"] = not run_config["condition"] == "Double"
     
-    config["max_router_iter"] = config["n_layer"] // config["expert_k"]
 
     if run_config["condition"] == "Ours-2xT":
         config["max_router_iter"] = config["max_router_iter"] * 2
-
-    if "ACT" in run_config["condition"]:
-        config["max_router_iter"] = 25
-        config["meta_controller"] = True
-    else:
-        config["meta_controller"] = False
-
 
 
     # # fast debugging
@@ -242,8 +239,8 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
         print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
     # model init
-    model_args = dict(n_layer=config["n_layer"], max_router_iter=config["max_router_iter"], expert_k=config["expert_k"], open_choice=config["open_choice"], weigh_experts=config["weigh_experts"], n_head=config["n_head"], n_embd=config["n_embd"], block_size=config["block_size"],
-                    bias=config["bias"], vocab_size=None, dropout=config["dropout"], expansion_factor=config["expansion_factor"], meta_controller=config["meta_controller"])
+    model_args = dict(n_layer=config["n_layer"], max_router_iter=config["max_router_iter"], identity_layers=config["identity_layers"], intermediate_outputs_training=config["intermediate_outputs_training"], expert_k=config["expert_k"], open_choice=config["open_choice"], weigh_experts=config["weigh_experts"], n_head=config["n_head"], n_embd=config["n_embd"], block_size=config["block_size"],
+                    bias=config["bias"], vocab_size=None, dropout=config["dropout"], expansion_factor=config["expansion_factor"])
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
