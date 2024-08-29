@@ -1,0 +1,39 @@
+---
+# - name: tmp
+#   condition: Ours
+#   n_layer: 5
+#   n_head: 4
+#   n_embd: 96
+#   dropout: 0.44293320242330486
+#   learning_rate: 1.652170920104858e-05
+#   max_router_iter: ?
+#   max_iters: 1900
+#   model_cls: GW_GPT
+- name: tmp
+  condition: Ours
+  n_layer: 1
+  n_head: 1
+  n_embd: 32
+  dropout: 0.44293320242330486
+  learning_rate: 1.652170920104858e-05
+  max_router_iter: 2
+  max_iters: 100
+  model_cls: GW_GPT
+# - name: bad-transformer # val_loss: 6.33
+#   condition: Transformer
+#   n_layer: 3
+#   n_head: 4
+#   n_embd: 96
+#   dropout: 0.44293320242330486
+#   learning_rate: 1.652170920104858e-05
+#   max_iters: 1900
+#   model_cls: GPT
+# - name: good-transformer # val_loss: 2.99
+#   condition: Transformer
+#   n_layer: 5
+#   n_head: 16
+#   n_embd: 960
+#   dropout: 0.2214670000693801
+#   learning_rate: 0.0005539426893794069
+#   max_iters: 61700
+#   model_cls: GPT

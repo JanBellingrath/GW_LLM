@@ -190,7 +190,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sweep_id = [None, "yilwx8g5", "52voc92u", "het0u5tt", "e8mjkq03"][0]
+    sweep_id = [None, "yilwx8g5", "52voc92u", "het0u5tt", "e8mjkq03", "qum883k6"][-1]
     if sweep_id is None:
         sweep_id = wandb.sweep(sweep=run_configuration, project="GW_LLM")
     count = 1000

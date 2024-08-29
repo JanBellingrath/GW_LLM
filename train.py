@@ -28,19 +28,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, GW_GPT
+from analyze_order import analyze_order
+from sample import sample
 
 # the following part ensures that only ONE GPU is seen
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# DEVICE = "cpu"
+DEVICE = "cpu"
 
 import wandb
 
 
 
-def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
+def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_samples=True):
 
     config = {}
 
@@ -151,6 +153,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     config["n_embd"] = config["n_embd"] * 2 if "2n_embd" in run_config["condition"] else config["n_embd"]
     config["n_head"] = config["n_head"] * 2 if "2n_head" in run_config["condition"] else config["n_head"]
     config["identity_layers"] = "no_ID" not in run_config["condition"]
+    config["always_save_checkpoint"] = True
 
         
     # if run_config["condition"] == "Big-Transformer":
@@ -270,23 +273,33 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
 
     # helps estimate an arbitrarily accurate loss over either split using many batches
     @torch.no_grad()
-    def estimate_loss():
+    def estimate_loss(return_routing_weights=False):
         out = {}
         # done_whens = {}
         model.eval()
+        routing_weights = {}
         for split in ['train', 'val']:
+            routing_weights[split] = []
             losses = torch.zeros(config["eval_iters"])
             # done_whens[split] = torch.zeros(eval_iters)
             for k in range(config["eval_iters"]):
                 X, Y = get_batch(split)
                 with ctx:
                     # logits, loss, done_when = model(X, Y)
-                    logits, loss = model(X, Y)
+                    if return_routing_weights:
+                        logits, loss, batch_routing_weights = model(X, Y, return_routing_weights=True)
+                        routing_weights[split].extend(batch_routing_weights)
+                    else:
+                        logits, loss = model(X, Y)
                 losses[k] = loss.item()
                 # done_whens[split][k] = done_when
             out[split] = losses.mean()
+            if return_routing_weights:
+                routing_weights[split] = np.array(routing_weights[split])
             # done_whens[split] = done_whens[split].mean()
         model.train()
+        if return_routing_weights:
+            return out, routing_weights
         return out#, done_whens
 
     # learning rate decay scheduler (cosine with warmup)
@@ -311,15 +324,20 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
     running_mfu = -1.0
     while True:
 
+        last_iteration = iter_num == config["max_iters"]
+
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if config["decay_lr"] else config["learning_rate"]
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % config["eval_interval"] == 0 and master_process:
+        if (iter_num % config["eval_interval"] == 0 and master_process) or last_iteration:
             # losses, done_whens = estimate_loss()
-            losses = estimate_loss()
+            if last_iteration:
+                losses, routing_weights = estimate_loss(return_routing_weights=True)
+            else:
+                losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             if config["wandb_log"]:
                 wandb.log({
@@ -390,9 +408,46 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True):
 
         # termination conditions
         if iter_num > config["max_iters"]:
+
+            routing_weights_topk = {}
+
+            for split in ['train', 'val']:
+            
+                routing_weights_topk[split] = routing_weights[split].copy().reshape(-1, routing_weights[split].shape[-1])
+                for i in range(routing_weights_topk[split].shape[0]):
+                    topval = np.sort(routing_weights_topk[split][i])[-config["expert_k"]]
+                    routing_weights_topk[split][i] = np.where(routing_weights_topk[split][i] < topval, 0, routing_weights_topk[split][i])
+                routing_weights_topk[split] /= routing_weights_topk[split].sum(axis=-1, keepdims=True)
+                routing_weights_topk[split] = routing_weights_topk[split].reshape(routing_weights[split].shape)
+
+                analyze_order(routing_weights_topk[split], dir=os.path.join(wandb.run.dir, split, 'topk'))
+                analyze_order(routing_weights[split], dir=os.path.join(wandb.run.dir, split, 'all'))
+
+                routing_table_data = [
+                    ["all", wandb.Image(os.path.join(wandb.run.dir, split, 'all', "layer_layer.png")), wandb.Image(os.path.join(wandb.run.dir, split, 'all', "layer_iter.png"))],
+                    ["topk", wandb.Image(os.path.join(wandb.run.dir, split, 'topk', "layer_layer.png")), wandb.Image(os.path.join(wandb.run.dir, split, 'topk', "layer_iter.png"))],
+                ]
+                routing_table = wandb.Table(data=routing_table_data, columns=["data", "layer_layer", "layer_iter"])
+                wandb.log({split+"/routing": routing_table})
+            
             break
 
     if ddp:
         destroy_process_group()
+
+    # We now want to sample a few sentences from the model
+    if gen_samples:
+        
+        # load enc from enc.pkl in data_dir
+        with open(os.path.join(data_dir, 'enc.pkl'), 'rb') as f:
+            enc = pickle.load(f)
+        
+        prompts, generations = sample(wandb.run.dir, model=model, enc=enc, write_to_file=False)
+
+        gen_table_data = [[prompts[i], generations[i]] for i in range(len(prompts))]
+        gen_table = wandb.Table(data=gen_table_data, columns=["Prompt", "Generation"])
+        wandb.log({"generations": gen_table})
+    
+
 
     return best_val_loss

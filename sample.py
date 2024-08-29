@@ -14,14 +14,27 @@ os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def sample(out_dir=None, model_cls=GPT):
+def sample(out_dir=None, model_cls=GPT, model=None, write_to_file=True, enc=None):
+
+    starts = [
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "The quick brown fox jumps over the lazy dog.",
+        "In a hole in the ground there lived a hobbit.",
+        "It was the best of times, it was the worst of times.",
+        "Hi there, how are you doing today?",
+        "Who are you?",
+        "What is the meaning of life?",
+    ]
 
     # -----------------------------------------------------------------------------
     init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
     out_dir = 'out' if out_dir is None else out_dir # ignored if init_from is not 'resume'
     # out_dir = 'out-shakespeare-char-Transformer'
-    start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-    num_samples = 10 # number of samples to draw
+    # start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
     max_new_tokens = 500 # number of tokens generated in each sample
     temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
     top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
@@ -40,22 +53,23 @@ def sample(out_dir=None, model_cls=GPT):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # model
-    if init_from == 'resume':
-        # init from a model saved in a specific directory
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        gptconf = GPTConfig(**checkpoint['model_args'])
-        model = model_cls(gptconf)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k,v in list(state_dict.items()):
-            print(k)
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-    elif init_from.startswith('gpt2'):
-        # init from a given GPT-2 model
-        model = model_cls.from_pretrained(init_from, dict(dropout=0.0))
+    if model is None:
+        if init_from == 'resume':
+            # init from a model saved in a specific directory
+            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            gptconf = GPTConfig(**checkpoint['model_args'])
+            model = model_cls(gptconf)
+            state_dict = checkpoint['model']
+            unwanted_prefix = '_orig_mod.'
+            for k,v in list(state_dict.items()):
+                print(k)
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            model.load_state_dict(state_dict)
+        elif init_from.startswith('gpt2'):
+            # init from a given GPT-2 model
+            model = model_cls.from_pretrained(init_from, dict(dropout=0.0))
 
     model.eval()
     model.to(device)
@@ -64,40 +78,58 @@ def sample(out_dir=None, model_cls=GPT):
 
     # look for the meta pickle in case it is available in the dataset folder
     load_meta = False
-    if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
+    if enc is None and init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
         meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
         load_meta = os.path.exists(meta_path)
-    if load_meta:
-        print(f"Loading meta from {meta_path}...")
-        with open(meta_path, 'rb') as f:
-            meta = pickle.load(f)
-        # TODO want to make this more general to arbitrary encoder/decoder schemes
-        stoi, itos = meta['stoi'], meta['itos']
-        encode = lambda s: [stoi[c] for c in s]
-        decode = lambda l: ''.join([itos[i] for i in l])
+
+    if enc is None:
+        if load_meta:
+            print(f"Loading meta from {meta_path}...")
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            # TODO want to make this more general to arbitrary encoder/decoder schemes
+            stoi, itos = meta['stoi'], meta['itos']
+            encode = lambda s: [stoi[c] for c in s]
+            decode = lambda l: ''.join([itos[i] for i in l])
+        else:
+            # ok let's assume gpt-2 encodings by default
+            print("No meta.pkl found, assuming GPT-2 encodings...")
+            enc = tiktoken.get_encoding("gpt2")
+            encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+            decode = lambda l: enc.decode(l)
     else:
-        # ok let's assume gpt-2 encodings by default
-        print("No meta.pkl found, assuming GPT-2 encodings...")
-        enc = tiktoken.get_encoding("gpt2")
         encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
         decode = lambda l: enc.decode(l)
 
-    # encode the beginning of the prompt
-    if start.startswith('FILE:'):
-        with open(start[5:], 'r', encoding='utf-8') as f:
-            start = f.read()
-    start_ids = encode(start)
-    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+    generations = []
 
     # run generation
     with torch.no_grad():
         with ctx:
-            # write samples to file in out_dir
-            with open(os.path.join(out_dir, 'samples.txt'), 'w', encoding='utf-8') as f:
-                for k in range(num_samples):
+                for k, start in enumerate(starts):
+
+                    # encode the beginning of the prompt
+                    if start.startswith('FILE:'):
+                        with open(start[5:], 'r', encoding='utf-8') as f:
+                            start = f.read()
+                    start_ids = encode(start)
+                    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                    
                     y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                    f.write(decode(y[0].tolist()))
-                    f.write('\n---------------\n')
+                    generations.append(decode(y[0].tolist()))
+
+    
+
+    # write samples to file in out_dir
+    if write_to_file:
+        with open(os.path.join(out_dir, 'samples.txt'), 'w', encoding='utf-8') as f:
+            for k, start in enumerate(starts):
+                f.write(f"Sample {k} (seed: {seed})\n")
+                f.write("Prompt: "+start+"\n\n"+"Generated")
+                f.write(generations[k])
+                f.write('\n---------------\n')
+
+    return starts, generations
 
 if __name__ == '__main__':
     sample()
