@@ -21,12 +21,9 @@ def sample(out_dir=None, model_cls=GPT, model=None, write_to_file=True, enc=None
         "\n",
         "\n",
         "\n",
-        "\n",
         "The quick brown fox jumps over the lazy dog.",
         "In a hole in the ground there lived a hobbit.",
-        "It was the best of times, it was the worst of times.",
         "Hi there, how are you doing today?",
-        "Who are you?",
         "What is the meaning of life?",
     ]
 
@@ -35,7 +32,7 @@ def sample(out_dir=None, model_cls=GPT, model=None, write_to_file=True, enc=None
     out_dir = 'out' if out_dir is None else out_dir # ignored if init_from is not 'resume'
     # out_dir = 'out-shakespeare-char-Transformer'
     # start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-    max_new_tokens = 500 # number of tokens generated in each sample
+    max_new_tokens = 100 # number of tokens generated in each sample
     temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
     top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
     seed = 1337
@@ -106,17 +103,22 @@ def sample(out_dir=None, model_cls=GPT, model=None, write_to_file=True, enc=None
     # run generation
     with torch.no_grad():
         with ctx:
-                for k, start in enumerate(starts):
+            for k, start in enumerate(starts):
 
-                    # encode the beginning of the prompt
-                    if start.startswith('FILE:'):
-                        with open(start[5:], 'r', encoding='utf-8') as f:
-                            start = f.read()
-                    start_ids = encode(start)
-                    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-                    
-                    y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                    generations.append(decode(y[0].tolist()))
+                # encode the beginning of the prompt
+                if start.startswith('FILE:'):
+                    with open(start[5:], 'r', encoding='utf-8') as f:
+                        start = f.read()
+                start_ids = encode(start)
+                x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                y_list = y[0].tolist()
+
+                # Remove any tokens that are greater than the maximum token value
+                y_list = [i for i in y_list if i <= enc.max_token_value]
+
+                generations.append(decode(y_list))
 
     
 

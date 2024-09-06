@@ -22,13 +22,15 @@ import math
 import pickle
 from contextlib import nullcontext
 
+from PIL import Image
+
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, GW_GPT
-from analyze_order import analyze_order
+from routing_analysis import routing_analysis
 from sample import sample
 
 # the following part ensures that only ONE GPU is seen
@@ -36,7 +38,7 @@ os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DEVICE = "cpu"
+# DEVICE = "cpu"
 
 import wandb
 
@@ -138,10 +140,14 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
     config["n_head"] = run_config["n_head"] if "n_head" in run_config else config["n_head"]
     config["n_embd"] = run_config["n_embd"] if "n_embd" in run_config else config["n_embd"]
     config["dropout"] = run_config["dropout"] if "dropout" in run_config else config["dropout"]
+    config["batch_size"] = run_config["batch_size"] if "batch_size" in run_config else config["batch_size"]
+    config["gradient_accumulation_steps"] = run_config["gradient_accumulation_steps"] if "gradient_accumulation_steps" in run_config else config["gradient_accumulation_steps"]
     if "learning_rate" in run_config:
         config["learning_rate"] = run_config["learning_rate"] 
         config["min_lr"] = config["learning_rate"] / 10
     config["max_iters"] = run_config["max_iters"] if "max_iters" in run_config else config["max_iters"]
+    config["eval_iters"] = run_config["eval_iters"] if "eval_iters" in run_config else config["eval_iters"]
+    config["eval_interval"] = run_config["eval_interval"] if "eval_interval" in run_config else config["eval_interval"]
     config["intermediate_outputs_training"] = run_config["intermediate_outputs_training"] if "intermediate_outputs_training" in run_config else False
     config["max_router_iter"] = config["n_layer"] // config["expert_k"] if 'max_router_iter' not in run_config else run_config["max_router_iter"]
 
@@ -154,6 +160,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
     config["n_head"] = config["n_head"] * 2 if "2n_head" in run_config["condition"] else config["n_head"]
     config["identity_layers"] = "no_ID" not in run_config["condition"]
     config["always_save_checkpoint"] = True
+    config["always_analyze_routing"] = True
 
         
     # if run_config["condition"] == "Big-Transformer":
@@ -273,33 +280,87 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
 
     # helps estimate an arbitrarily accurate loss over either split using many batches
     @torch.no_grad()
-    def estimate_loss(return_routing_weights=False):
+    def estimate_loss(analyze_routing=False, step=None):
         out = {}
         # done_whens = {}
         model.eval()
-        routing_weights = {}
+
         for split in ['train', 'val']:
-            routing_weights[split] = []
-            losses = torch.zeros(config["eval_iters"])
+            routing_weights = []
+            losses = {}
             # done_whens[split] = torch.zeros(eval_iters)
             for k in range(config["eval_iters"]):
                 X, Y = get_batch(split)
                 with ctx:
                     # logits, loss, done_when = model(X, Y)
-                    if return_routing_weights:
+                    if analyze_routing:
                         logits, loss, batch_routing_weights = model(X, Y, return_routing_weights=True)
-                        routing_weights[split].extend(batch_routing_weights)
+
+                        routing_weights.extend(batch_routing_weights)
                     else:
                         logits, loss = model(X, Y)
-                losses[k] = loss.item()
+
+                for key, value in loss.items():
+                    if key not in losses:
+                        losses[key] = torch.zeros(config["eval_iters"], requires_grad=False)
+                    losses[key][k] = value.detach().item()
+
                 # done_whens[split][k] = done_when
-            out[split] = losses.mean()
-            if return_routing_weights:
-                routing_weights[split] = np.array(routing_weights[split])
+            out[split] = {key: value.mean().item() for key, value in losses.items()}
+            if analyze_routing:
+                routing_weights = np.array(routing_weights)
+
+                routing_analysis(routing_weights, dir=os.path.join(wandb.run.dir, split, 'all'))
+
+                routing_weights_shape = routing_weights.shape                    
+                routing_weights = routing_weights.reshape(-1, routing_weights.shape[-1])
+                for i in range(routing_weights.shape[0]):
+                    topval = np.sort(routing_weights[i])[-config["expert_k"]]
+                    routing_weights[i] = np.where(routing_weights[i] < topval, 0, routing_weights[i])
+                routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
+                routing_weights = routing_weights.reshape(routing_weights_shape)
+
+                routing_analysis(routing_weights, dir=os.path.join(wandb.run.dir, split, 'topk'))
+
+                routing_table_data = [
+                    [
+                        "all", 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_mean.png")))),
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_layer.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_iter.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_token.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_seq.png")))),
+                    ],
+                    [
+                        "topk", 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'topk', "layer_mean.png")))),
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'topk', "layer_iter.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'topk', "layer_layer.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'topk', "layer_token.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'topk', "layer_seq.png")))),
+                    ]
+                ]
+                routing_table = wandb.Table(data=routing_table_data, columns=["data", "layer_mean", "layer_iter", "layer_layer", "layer_token", "layer_seq"])
+                wandb.log({split+"/routing": routing_table}, step=step+1)
+
+                images = {}
+                for selection in ["all", "topk"]:
+                    for data_type in ["layer_layer", "layer_iter", "layer_token", "layer_seq", "layer_mean"]:
+                        images["/".join([split, selection, data_type])] = wandb.Image(os.path.join(wandb.run.dir, split, selection, f"{data_type}.png"))
+                wandb.log(images, step=step+1)
             # done_whens[split] = done_whens[split].mean()
+            
         model.train()
-        if return_routing_weights:
-            return out, routing_weights
         return out#, done_whens
 
     # learning rate decay scheduler (cosine with warmup)
@@ -324,6 +385,8 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
     running_mfu = -1.0
     while True:
 
+        print("Starting iteration", iter_num)
+
         last_iteration = iter_num == config["max_iters"]
 
         # determine and set the learning rate for this iteration
@@ -334,22 +397,23 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
         # evaluate the loss on train/val sets and write checkpoints
         if (iter_num % config["eval_interval"] == 0 and master_process) or last_iteration:
             # losses, done_whens = estimate_loss()
-            if last_iteration:
-                losses, routing_weights = estimate_loss(return_routing_weights=True)
-            else:
-                losses = estimate_loss()
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            losses = estimate_loss(analyze_routing=last_iteration or config["always_analyze_routing"], step=iter_num)
+            print(f"step {iter_num}: train loss {losses['train']['total']:.4f}, val loss {losses['val']['total']:.4f}")
             if config["wandb_log"]:
-                wandb.log({
+                
+                wandb_log = {
                     "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
                     "lr": lr,
                     "mfu": running_mfu*100, # convert to percentage
-                })
-            if losses['val'] < best_val_loss or config["always_save_checkpoint"]:
-                best_val_loss = losses['val']
-                # done_when = done_whens['val']
+                }
+                for split in ['train', 'val']:
+                    for key, value in losses[split].items():
+                        wandb_log[f"{split}/{key}"] = value
+                wandb.log(wandb_log, step=iter_num+1)
+
+            if losses['val']['total'] < best_val_loss or config["always_save_checkpoint"]:
+                best_val_loss = losses['val']['total']
+                # done_when = done_whens['val']['total']
                 if iter_num > 0 and save_checkpoint:
                     checkpoint = {
                         'model': raw_model.state_dict(),
@@ -361,6 +425,27 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
                     }
                     print(f"saving checkpoint to {out_dir}")
                     torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
+                # We now want to sample a few sentences from the model
+                if gen_samples:
+
+
+                    model.eval()
+                
+                    # load enc from enc.pkl in data_dir
+                    with open(os.path.join(data_dir, 'enc.pkl'), 'rb') as f:
+                        enc = pickle.load(f)
+                    
+                    prompts, generations = sample(wandb.run.dir, model=model, enc=enc, write_to_file=False)
+
+                    gen_table = wandb.Table(columns=["Prompt", "Generation"])
+                    for i in range(len(prompts)):
+                        gen_table.add_data(prompts[i], generations[i])
+
+                    wandb.log({"generations": gen_table}, step=iter_num+1)
+
+                    model.train()
+                
         if iter_num == 0 and config["eval_only"]:
             break
 
@@ -376,6 +461,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
             with ctx:
                 # logits, loss, done_when = model(X, Y)
                 logits, loss = model(X, Y)
+                loss = loss['total']
                 loss = loss / config["gradient_accumulation_steps"] # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch('train')
@@ -407,46 +493,11 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
         local_iter_num += 1
 
         # termination conditions
-        if iter_num > config["max_iters"]:
-
-            routing_weights_topk = {}
-
-            for split in ['train', 'val']:
-            
-                routing_weights_topk[split] = routing_weights[split].copy().reshape(-1, routing_weights[split].shape[-1])
-                for i in range(routing_weights_topk[split].shape[0]):
-                    topval = np.sort(routing_weights_topk[split][i])[-config["expert_k"]]
-                    routing_weights_topk[split][i] = np.where(routing_weights_topk[split][i] < topval, 0, routing_weights_topk[split][i])
-                routing_weights_topk[split] /= routing_weights_topk[split].sum(axis=-1, keepdims=True)
-                routing_weights_topk[split] = routing_weights_topk[split].reshape(routing_weights[split].shape)
-
-                analyze_order(routing_weights_topk[split], dir=os.path.join(wandb.run.dir, split, 'topk'))
-                analyze_order(routing_weights[split], dir=os.path.join(wandb.run.dir, split, 'all'))
-
-                routing_table_data = [
-                    ["all", wandb.Image(os.path.join(wandb.run.dir, split, 'all', "layer_layer.png")), wandb.Image(os.path.join(wandb.run.dir, split, 'all', "layer_iter.png"))],
-                    ["topk", wandb.Image(os.path.join(wandb.run.dir, split, 'topk', "layer_layer.png")), wandb.Image(os.path.join(wandb.run.dir, split, 'topk', "layer_iter.png"))],
-                ]
-                routing_table = wandb.Table(data=routing_table_data, columns=["data", "layer_layer", "layer_iter"])
-                wandb.log({split+"/routing": routing_table})
-            
+        if iter_num > config["max_iters"]:            
             break
 
     if ddp:
         destroy_process_group()
-
-    # We now want to sample a few sentences from the model
-    if gen_samples:
-        
-        # load enc from enc.pkl in data_dir
-        with open(os.path.join(data_dir, 'enc.pkl'), 'rb') as f:
-            enc = pickle.load(f)
-        
-        prompts, generations = sample(wandb.run.dir, model=model, enc=enc, write_to_file=False)
-
-        gen_table_data = [[prompts[i], generations[i]] for i in range(len(prompts))]
-        gen_table = wandb.Table(data=gen_table_data, columns=["Prompt", "Generation"])
-        wandb.log({"generations": gen_table})
     
 
 

@@ -19,13 +19,11 @@ def main():
     with open("configs.yaml", "r") as file:
         configs = yaml.safe_load(file)
 
-    out_dir = "babylm/"
-
     # Launch one run per config
     for config in configs:
         run = wandb.init(project="GW_LLM", config=config)
         run_config = wandb.config
-        best_val_loss = objective(run_config, seed=42, out_dir=out_dir+config["name"])
+        best_val_loss = objective(run_config, seed=42, out_dir=f"wandb_runs_ckpt/{run.id}-{run.name}")
         run.log({"best_val_loss": best_val_loss})
         run.finish()
 

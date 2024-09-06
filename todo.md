@@ -9,20 +9,20 @@
     - ours adaptive computation
     - moyenner loss avec T fixe
 
-    - [o] avoir bon transformer avant de tester autre chose
+    - [x] avoir bon transformer avant de tester autre chose
         - [x] lancer opt
-        -> [ ] générations pire et meilleur config
+        - [x] générations pire et meilleur config
     - [ ] before further ours
         - [x] optimize D_router
         - [x] k couches identité (en plus des n layers)
         - [x] T max avant ACT
             - [x] opt en loss cumulée et test au dernier t
         - [ ] routing for each token
-            - [ ] iterate over tokens, 
-            - [ ] hide future to router
-            - [ ] fix order analysis with change of shape
-            - [ ] TODO: find parts of the batch where expert is selected 
-            - [ ] except if targets is None (i.e. inference-time)
+            - [x] iterate over tokens, 
+            - [x] hide future to router
+            - [x] fix order analysis with change of shape
+            - [x] TODO: find parts of the batch where expert is selected 
+            - [x] except if targets is None (i.e. inference-time)
     - [ ] analyses
         - [ ] does adding identity layers help?
         - [ ] ours vs transformer
@@ -49,3 +49,9 @@
     - [x] entraîner plus comme BERT, prédire un token à la fois
         - [x] check how it is trained now
             - [x] BERT training: hide or corrupt token with probability (multiple tokens can be selected)
+
+
+- load balancing wout id
+- transformer comparison
+- préentrainer couches, capable de refaire archi? Déviation de l'archi dans certains cas ?
+- arithmetic chaining
