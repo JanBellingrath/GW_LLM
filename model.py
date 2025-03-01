@@ -427,14 +427,15 @@ class GW_GPT(GPT):
             if config.identity_layers:
                 self.router_proj_size += 1 # Add an identity layer that will be used at each step
 
-        self.transformer["router"] = nn.LSTM(
-            input_size=config.block_size * config.n_embd,
-            hidden_size=config.LSTM_hidden_size, 
-            num_layers=config.n_LSTM_layer, 
-            dropout=config.dropout
-        )
+        # self.transformer["router"] = nn.LSTM(
+        #     input_size=config.block_size * config.n_embd,
+        #     hidden_size=config.LSTM_hidden_size, 
+        #     num_layers=config.n_LSTM_layer, 
+        #     dropout=config.dropout
+        # )
+        # self.router_linear = nn.Linear(config.LSTM_hidden_size, self.router_proj_size)
 
-        self.router_linear = nn.Linear(config.LSTM_hidden_size, self.router_proj_size)
+        self.router_linear = nn.Linear(config.n_embd, self.router_proj_size, bias=False)
 
         # Predetermine block groups for each time step if open_choice is False
         if not config.open_choice:
@@ -453,20 +454,8 @@ class GW_GPT(GPT):
         routing_weights_list = []
         router_logits_tuple = tuple()
 
-        causal_mask = torch.tril(torch.ones(block_size, block_size)).to(x.device).bool().unsqueeze(0).unsqueeze(-1)
+        # causal_mask = torch.tril(torch.ones(block_size, block_size)).to(x.device).bool().unsqueeze(0).unsqueeze(-1)
         token_arange = torch.arange(block_size).to(x.device)[None, :].repeat(batch_size, 1).reshape(-1)
-
-        # n_objects = 0
-        # for obj in gc.get_objects():
-        #     try:
-        #         if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-        #             # print(type(obj), obj.size())
-        #             n_objects += 1
-        #     except:
-        #         pass
-
-        # print("n_objects:", n_objects)
-        # print("x:", x.shape, self.training)
 
         # Tensor dimensions:
         # causal_mask: (1, block_size, block_size, 1)
@@ -477,34 +466,25 @@ class GW_GPT(GPT):
         i = 0      
         while i < self.config.max_router_iter:
 
-            # print("i", i)
-            # print("\t 1 alloc:", round(torch.cuda.memory_allocated(0)/1e9, 2))
-
-
-            # print(i, torch.cuda.memory_summary())
-
-            # # Dynamic expert selection
-            # print("x shape", x.shape)
+            # Dynamic expert selection
             padding = torch.zeros(x.shape[0], self.config.block_size - x.shape[1], x.shape[2]).to(x.device).to(x.dtype)
-            # print("padding shape", padding.shape)
             x = torch.cat((padding, x), dim=1)
-            # print("new x shape", x.shape)
 
-            x = x[:,:,None,:].repeat(1,1,block_size,1)
-            x *= causal_mask
+            # x = x[:,:,None,:].repeat(1,1,block_size,1)
+            # x *= causal_mask
 
-            router_logits, router_state = self.transformer["router"](x.reshape(1, batch_size * block_size, n_embd * block_size), router_state)
-            router_logits = self.router_linear(router_logits.squeeze(0))
+            # router_logits, router_state = self.transformer["router"](x.reshape(1, batch_size * block_size, n_embd * block_size), router_state)
+            # router_logits = self.router_linear(router_logits.squeeze(0))
+
+            router_logits = self.router_linear(x.reshape(batch_size * block_size, n_embd))
 
             routing_weights = F.softmax(router_logits, dim=-1, dtype=x.dtype)
-
 
             # Tensor dimensions:
             # x: (batch_size, block_size, block_size, n_embd)
             # router_state: (n_LSTM_layer, batch_size * block_size, LSTM_hidden_size)
             # router_logits: (1, batch_size * block_size, router_proj_size)
             # routing_weights: (batch_size * block_size, router_proj_size)
-            
             
             if return_routing_weights:
                 routing_weights_list.append(routing_weights.reshape(batch_size, block_size, -1))
@@ -515,19 +495,12 @@ class GW_GPT(GPT):
                 routing_weights, selected_experts = torch.topk(routing_weights, self.config.expert_k, dim=-1)
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-                # print("\t 3 alloc:", round(torch.cuda.memory_allocated(0)/1e9, 2))
-
-
                 # Cast back to the input dtype
                 routing_weights = routing_weights.to(x.dtype)
 
                 output = torch.zeros(
                     (batch_size * block_size, n_embd), dtype=x.dtype, device=x.device
                 )               
-
-                # print("\t 4 alloc:", round(torch.cuda.memory_allocated(0)/1e9, 2))
- 
-
 
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)).permute(2, 1, 0)
     
@@ -536,22 +509,10 @@ class GW_GPT(GPT):
                 # expert_mask: (n_layer + n_identity_layers, expert_k, batch_size * block_size)
                 # routing_weights: (batch_size * block_size, expert_k)
 
-                x = x.view(batch_size * block_size, block_size, n_embd)
-
-                # print("\t 5 alloc:", round(torch.cuda.memory_allocated(0)/1e9, 2))
-
+                # x = x.view(batch_size * block_size, block_size, n_embd)
 
                 # Loop over all available experts in the model and perform the computation on each expert
                 for expert_idx in range(self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)):
-                    # print("\t Expert idx", expert_idx)
-
-                    # print("\t\t 6 alloc", expert_idx, round(torch.cuda.memory_allocated(0)/1e9, 2))
-
-                    # r = torch.cuda.memory_reserved(0)
-                    # a = torch.cuda.memory_allocated(0)
-                    # f = r-a  # free memory
-                    # print("\t\t Memory", round(r/1e9, 2), round(a/1e9, 2), round(f/1e9, 2))
-                    # print("\t\t Memory allocated", round(torch.cuda.memory_allocated(0)/1e9, 2))
                     expert_layer = None if expert_idx >= self.config.n_layer and self.config.identity_layers else self.transformer.h[expert_idx]
 
                     expert_dim_ind, example_dim_ind = torch.where(expert_mask[expert_idx])
@@ -561,26 +522,53 @@ class GW_GPT(GPT):
                     # example_dim_ind: (n_expert_selections) - The indices of the batch_size * block_size dimension where the expert is selected
 
                     if len(expert_dim_ind) > 0:
+                        # if expert_layer is None:
+                        #     current_x = x[example_dim_ind]
+                        # else:
+                        #     current_x = expert_layer(x[example_dim_ind])
+
+                        # # Tensor dimensions:
+                        # # current_x: (n_expert_selections, block_size, n_embd)
+                        # # routing_weights: (batch_size * block_size, expert_k)
+
+                        # print("slow", current_x.shape)
+
+                        # current_x *= routing_weights[example_dim_ind, expert_dim_ind, None, None]
+                        
+                        # # Now we select the token to update for each example
+                        # current_x = current_x[torch.arange(current_x.shape[0]), token_arange[example_dim_ind]]
+
+                        # # Accumulate the outputs
+                        # output.index_add_(0, example_dim_ind, current_x.to(x.dtype))
+
+                        # slow_contribution = torch.zeros_like(output)
+                        # slow_contribution.index_add_(0, example_dim_ind, current_x.to(x.dtype))
+
+                        # We can make the computation faster by calling the expert layer once
                         if expert_layer is None:
-                            current_x = x[example_dim_ind]
+                            current_x = x[:,:,None,:].repeat(1,1,block_size,1).reshape(batch_size * block_size, block_size, n_embd)[example_dim_ind]
                         else:
-                            # print("Expert layer", x[example_dim_ind].shape)
-                            # print("\t\t 7 alloc", expert_idx, round(torch.cuda.memory_allocated(0)/1e9, 2))
-                            current_x = expert_layer(x[example_dim_ind])
-                            # print("\t\t 8 alloc", expert_idx, round(torch.cuda.memory_allocated(0)/1e9, 2))
-
-                        # Tensor dimensions:
-                        # current_x: (n_expert_selections, block_size, n_embd)
-                        # routing_weights: (batch_size * block_size, expert_k)
-
+                            current_x = expert_layer(x)
+                            # print("fast", current_x.shape)
+                            current_x = current_x[:,:,None,:].repeat(1,1,block_size,1).reshape(batch_size * block_size, block_size, n_embd)[example_dim_ind]
+                            # print("fast", current_x.shape)
+                            
                         current_x *= routing_weights[example_dim_ind, expert_dim_ind, None, None]
                         
-
                         # Now we select the token to update for each example
                         current_x = current_x[torch.arange(current_x.shape[0]), token_arange[example_dim_ind]]
-
+                            
                         # Accumulate the outputs
                         output.index_add_(0, example_dim_ind, current_x.to(x.dtype))
+                        
+                        # # fast_contribution = torch.zeros_like(output)
+                        # slow_contribution.index_add_(0, example_dim_ind, current_x.to(x.dtype))
+
+                        # # We now check that the computation is correct
+                        # print(expert_layer is not None, torch.allclose(fast_contribution, slow_contribution))
+
+                        # # Now print mse between the two
+                        # print(torch.nn.functional.mse_loss(fast_contribution, slow_contribution))
 
                 output = output.view(batch_size, block_size, n_embd)
 
@@ -588,46 +576,34 @@ class GW_GPT(GPT):
 
             else:
 
-                assert False, "Not implemented"
+                # Cast back to the input dtype
+                routing_weights = routing_weights.to(x.dtype)
+
+                output = torch.zeros_like(x)
+
+                # Tensor dimensions:
+                
+                
+                for expert_i, expert_idx in enumerate(range(i * (self.config.expert_k + (1 if self.config.identity_layers else 0)), (i + 1) * (self.config.expert_k + (1 if self.config.identity_layers else 0)))):
+
+                    if self.config.identity_layers and expert_i == self.config.expert_k:
+                        current_x = x
+                    else:
+                        expert_layer = self.transformer.h[expert_idx]
+                        current_x = expert_layer(x)
+                    if self.config.weigh_experts:
+                        current_x = current_x * routing_weights[:, expert_i].view(-1, 1, 1) # Weight the outputs
+                    else:
+                        current_x = current_x / (self.config.expert_k + (1 if self.config.identity_layers else 0)) # Average the outputs
+
+                    # Accumulate the outputs
+                    output += current_x
 
             x = output
-            outputs.append(self.transformer.ln_f(output))
-
-            # # Free up memory
-            # del router_logits
-            # # del router_state
-            # # router_state = None
-            # del routing_weights
-            # del selected_experts
-            # del expert_mask
-            # del output
-            # gc.collect()
-            # torch.cuda.empty_cache()
-
-            # # Check memory usage of the model (router and transformer)
-            # numel = 0
-            # obj_list = []
-            # obj_list.extend(self.transformer["router"].parameters())
-            # for obj in self.transformer.h:
-            #     obj_list.extend(obj.parameters())
-            # for obj in obj_list:
-            #     numel += obj.numel()
-            # print("Memory usage of the model (router and transformer):", numel)
-            
+            outputs.append(self.transformer.ln_f(output)) 
             
 
             i += 1
-
-            # print("Shapes:")
-            # print("\t causal_mask", causal_mask.shape)
-            # print("\t token_arange", token_arange.shape)
-            # print("\t x", x.shape)
-            # print("\t router_state", router_state[0].shape)
-            # print("\t router_logits", router_logits.shape)
-            # print("\t routing_weights", routing_weights.shape)
-            # print("\t selected_experts", selected_experts.shape)
-            # print("\t expert_mask", expert_mask.shape)
-            # print("\t output", output.shape)
             
         x = self.transformer.ln_f(x)
         

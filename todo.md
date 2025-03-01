@@ -51,7 +51,28 @@
             - [x] BERT training: hide or corrupt token with probability (multiple tokens can be selected)
 
 
-- load balancing wout id
-- transformer comparison
-- préentrainer couches, capable de refaire archi? Déviation de l'archi dans certains cas ?
-- arithmetic chaining
+Todo Rufin:
+    - [ ] transformer comparison
+    - [ ] préentrainer couches, capable de refaire archi? Déviation de l'archi dans certains cas ?
+    - [ ] arithmetic chaining
+
+- quelle dim input routeur chez mixtral ?
+- peut sauver comput en appelant qu'une fois transformer sur tous tokens si au moins un du batch a besoin de l'expert
+
+Discussion Rufin:
+    - Routeur
+        - Besoin RNN ?
+        - Besoin d'envoyer tous les tokens ? Mixtral gate input: (batch * sequence_length, hidden_dim) (mais après contextualisation car MoE que pour MLP)
+
+Todo aujourd'hui:
+    - [ ] arithmetic
+        - [ ] tester si fonctionne toujours
+    - [ ] tester si moins d'utilisation mémoire
+    - [ ] lancer slow with simple router
+
+
+- [ ] dire au routeur où on est (pos ou scalar), ou alors donner toute la séquence
+- [ ] correlation enlever diagonale
+- [ ] matrice de fréquence de sélection conjointe d'experts
+- [ ] plots de routage instance-wise
+- [ ] augmenter nb de couches et pas de temps, pas forcément embd pour limiter transformer, et voir si toujours moins bon que trans

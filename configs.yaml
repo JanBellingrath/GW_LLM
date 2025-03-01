@@ -11,6 +11,18 @@
   max_iters: 61700
   model_cls: GW_GPT
   batch_size: 2 # micro batch size if gradient_accumulation_steps > 1
+# - name: equivalent_transformer
+#   condition: Transformer
+#   n_layer: 10
+#   n_head: 4
+#   n_embd: 128
+#   dropout: 0.22
+#   learning_rate: 0.0005
+#   gradient_accumulation_steps: 32
+#   max_iters: 61700
+#   # lr_decay_iters: 10000
+#   model_cls: GPT
+#   batch_size: 2 # micro batch size if gradient_accumulation_steps > 1
 # - name: fast_GW_GPT # for quick debugging
 #   condition: Ours
 #   n_layer: 1

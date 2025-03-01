@@ -35,7 +35,7 @@ from sample import sample
 
 # the following part ensures that only ONE GPU is seen
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
-os.environ["CUDA_VISIBLE_DEVICES"]="1"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # DEVICE = "cpu"
@@ -123,6 +123,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
     config["warmup_iters"] = 100 # not super necessary potentially
 
     # GW configs
+    config["warmup_iters"] = 2000
     config["eval_iters"] = 200
     config["log_interval"] = 10
     config["block_size"] = 256
@@ -146,6 +147,7 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
         config["learning_rate"] = run_config["learning_rate"] 
         config["min_lr"] = config["learning_rate"] / 10
     config["max_iters"] = run_config["max_iters"] if "max_iters" in run_config else config["max_iters"]
+    config["lr_decay_iters"] = run_config["lr_decay_iters"] if "lr_decay_iters" in run_config else config["max_iters"] # make equal to max_iters usually
     config["eval_iters"] = run_config["eval_iters"] if "eval_iters" in run_config else config["eval_iters"]
     config["eval_interval"] = run_config["eval_interval"] if "eval_interval" in run_config else config["eval_interval"]
     config["intermediate_outputs_training"] = run_config["intermediate_outputs_training"] if "intermediate_outputs_training" in run_config else False
@@ -326,11 +328,11 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
                     [
                         "all", 
                         wandb.Image(np.asarray(Image.open(
-                            os.path.join(wandb.run.dir, split, 'all', "layer_mean.png")))),
-                        wandb.Image(np.asarray(Image.open(
-                            os.path.join(wandb.run.dir, split, 'all', "layer_layer.png")))), 
+                            os.path.join(wandb.run.dir, split, 'all', "layer_mean.png")))), 
                         wandb.Image(np.asarray(Image.open(
                             os.path.join(wandb.run.dir, split, 'all', "layer_iter.png")))), 
+                        wandb.Image(np.asarray(Image.open(
+                            os.path.join(wandb.run.dir, split, 'all', "layer_layer.png")))),
                         wandb.Image(np.asarray(Image.open(
                             os.path.join(wandb.run.dir, split, 'all', "layer_token.png")))), 
                         wandb.Image(np.asarray(Image.open(
@@ -397,7 +399,8 @@ def objective(run_config, seed=None, out_dir=None, save_checkpoint=True, gen_sam
         # evaluate the loss on train/val sets and write checkpoints
         if (iter_num % config["eval_interval"] == 0 and master_process) or last_iteration:
             # losses, done_whens = estimate_loss()
-            losses = estimate_loss(analyze_routing=last_iteration or config["always_analyze_routing"], step=iter_num)
+            analyze_routing = (last_iteration or config["always_analyze_routing"]) and config["model_cls"] == GW_GPT
+            losses = estimate_loss(analyze_routing=analyze_routing, step=iter_num)
             print(f"step {iter_num}: train loss {losses['train']['total']:.4f}, val loss {losses['val']['total']:.4f}")
             if config["wandb_log"]:
                 
