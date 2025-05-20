@@ -10,11 +10,13 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import gc
+import sys
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -55,9 +57,9 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -108,25 +110,48 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # core GPT-2 params
+    block_size: int              = 1024
+    vocab_size: int              = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int                 = 12
+    n_head: int                  = 12
+    n_embd: int                  = 768
+    dropout: float               = 0.0
+    bias: bool                   = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    # feed-forward expansion
+    expansion_factor: int        = 4
+
+    # optional behaviours
+    intermediate_outputs_training: bool = False
+    identity_layers: bool               = False
+    load_balancing_weight: float        = 0.0 # Default value from the Switch Transformer paper (https://arxiv.org/abs/2101.03961)
+    exclude_id_load_balancing: bool     = True
+    expert_k: int                       = 12
+    max_router_iter: int                = 12
+    open_choice: bool                   = True
+    weigh_experts: bool                 = True
+    
+    # router fields
+    router_num_layers: int        = 2
+    router_hidden_dim: int        = 1024
+    router_dropout: float         = 0.0
+    softmax_temperature: float    = 1.0
+    
+    # Normalization options
+    normalize_router_logits: bool = False
+    normalize_residual_stream: bool = False
+    
+    # Temperature annealing options
+    temperature_schedule: str = 'constant'        # 'constant'|'linear'|'exponential'
+    temperature_initial: float = 1.0
+    temperature_final: float = 1.0
+    temperature_anneal_fraction: float = 1.0     # fraction of max_iters
+    
+    # Legacy fields (keeping for backward compatibility)
     n_LSTM_layer: int = 2
     LSTM_hidden_size: int = 1024
-    expert_k: int = 2
-    max_router_iter: int = 6
-    open_choice: bool = False
-    weigh_experts: bool = True
-    expansion_factor: int = 4
-    intermediate_outputs_training: bool = False
-    identity_layers: bool = False
-    load_balancing_weight: float = 1e-2 # Default value from the Switch Transformer paper (https://arxiv.org/abs/2101.03961)
-    exclude_id_load_balancing: bool = True
-    
+
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -180,6 +205,10 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def pre_blocks_forward(self, idx, targets=None):
+        # Reset router states at the start of each new sequence/batch
+        if hasattr(self, 'use_router_lstm') and self.use_router_lstm:
+            self.router.reset_states()
+            
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -211,9 +240,9 @@ class GPT(nn.Module):
             loss["total"] = loss["cross_entropy"]
 
             # If GW class, then calculate the load balancing loss
-            if isinstance(self, GW_GPT):
-                loss["load_balancing"] = self.load_balancing_loss(router_logits) * self.config.load_balancing_weight
-                loss["total"] += loss["load_balancing"]
+            #if isinstance(self, GW_GPT):
+             #   loss["load_balancing"] = self.load_balancing_loss(router_logits) * self.config.load_balancing_weight
+              #  loss["total"] += loss["load_balancing"]
                 
 
         else:
@@ -265,7 +294,23 @@ class GPT(nn.Module):
 
         return overall_loss * num_experts
 
-    def forward(self, idx, targets=None):
+    def forward(self,
+                idx,
+                targets: Optional[torch.Tensor] = None,
+                return_routing_weights: bool = False,
+                reset_router: bool = True
+               ):
+        """
+        Args:
+            idx: LongTensor of shape (B, T)
+            targets: LongTensor of same shape for CE loss (optional)
+            return_routing_weights: whether to return the router outputs
+            reset_router: if True, zero the LSTM hidden/cell states before this forward
+        """
+        if self.use_router_lstm and reset_router:
+            # only clear memory when requested
+            self.router.reset_states()
+            
         x = self.pre_blocks_forward(idx, targets)
         
         for block in self.transformer.h:
@@ -393,11 +438,15 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        # Reset router once at generation start
+        if hasattr(self, 'use_router_lstm') and self.use_router_lstm:
+            self.router.reset_states()
+            
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, reset_router=False)  # Don't reset router during generation
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -417,172 +466,198 @@ class GW_GPT(GPT):
 
     def __init__(self, config):
         super().__init__(config)
-
+        
         if config.open_choice:
             self.router_proj_size = config.n_layer
             if config.identity_layers:
-                self.router_proj_size += config.expert_k # Add enough identity layers to match the number of experts
+                self.router_proj_size += config.expert_k
         else:
             self.router_proj_size = config.expert_k
             if config.identity_layers:
-                self.router_proj_size += 1 # Add an identity layer that will be used at each step
+                self.router_proj_size += 1
+        
+        # Determine which router implementation to use
+        if hasattr(config, 'router_num_layers') and hasattr(config, 'router_hidden_dim'):
+            # Use the more sophisticated RouterLSTM implementation
+            from router_lstm import RouterLSTM
+            self.use_router_lstm = True
+            self.router = RouterLSTM(
+                input_dim=config.n_embd,
+                hidden_dim=config.router_hidden_dim,
+                num_layers=config.router_num_layers,
+                output_dim=self.router_proj_size,  # Use router_proj_size for output dimension
+                block_size=config.block_size,  # Pass block_size for sequence padding
+                dropout=config.router_dropout if hasattr(config, 'router_dropout') else 0.0,
+                config=config  # Pass config for normalization options
+            )
+            self.softmax_temperature = config.softmax_temperature if hasattr(config, 'softmax_temperature') else 1.0
+        else:
+            # Use the simple LSTM router that directly outputs layer choices
+            self.use_router_lstm = False
+            self.router_lstm = nn.LSTM(
+                input_size=1,  # Constant input of 1s
+                hidden_size=self.router_proj_size,  # Output size matches number of layer choices
+                num_layers=1,
+                batch_first=True
+            )
+            self.softmax_temperature = 1.0
 
-        # self.transformer["router"] = nn.LSTM(
-        #     input_size=config.block_size * config.n_embd,
-        #     hidden_size=config.LSTM_hidden_size, 
-        #     num_layers=config.n_LSTM_layer, 
-        #     dropout=config.dropout
-        # )
-        # self.router_linear = nn.Linear(config.LSTM_hidden_size, self.router_proj_size)
-
-        self.router_linear = nn.Linear(config.n_embd, self.router_proj_size, bias=False)
+        # Freeze all parameters
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        # Only unfreeze router parameters
+        if self.use_router_lstm:
+            for param in self.router.parameters():
+                param.requires_grad = True
+        else:
+            for param in self.router_lstm.parameters():
+                param.requires_grad = True
 
         # Predetermine block groups for each time step if open_choice is False
         if not config.open_choice:
             assert config.n_layer % config.expert_k == 0, "Number of layers must be divisible by number of experts per step."
             self.block_groups = [list(range(i, i + config.expert_k)) for i in range(0, config.n_layer, config.expert_k)]
 
+        # Add logging counter
+        self.forward_counter = 0
+
     def forward(self, idx, targets=None, return_routing_weights=False):
+        # Reset router states at the start of each new sequence
+        if self.use_router_lstm:
+            self.router.reset_states()
+            
         x = self.pre_blocks_forward(idx, targets)
 
-        batch_size, n_embd = x.shape[0], x.shape[2]
+        batch_size, seq_len, n_embd = x.shape
         block_size = self.config.block_size 
 
-        router_state = None
+        router_state = None  # For original router_lstm
 
         outputs = []
         routing_weights_list = []
         router_logits_tuple = tuple()
 
-        # causal_mask = torch.tril(torch.ones(block_size, block_size)).to(x.device).bool().unsqueeze(0).unsqueeze(-1)
-        token_arange = torch.arange(block_size).to(x.device)[None, :].repeat(batch_size, 1).reshape(-1)
+        token_arange = torch.arange(seq_len).to(x.device)[None, :].repeat(batch_size, 1).reshape(-1)
 
-        # Tensor dimensions:
-        # causal_mask: (1, block_size, block_size, 1)
-        # token_arange: (batch_size * block_size)
+        # Log router stats every 100 forward passes if wandb is available
+        should_log = hasattr(self, 'forward_counter') and self.forward_counter % 100 == 0 and self.training
+        router_stats = {}
 
+        # Compute current temperature based on schedule
+        if hasattr(self, 'forward_counter'):
+            iter_num = self.forward_counter
+            max_iters = self.config.max_iters if hasattr(self.config, 'max_iters') else 2000
+            sched = self.config.temperature_schedule
+            T0, T1 = self.config.temperature_initial, self.config.temperature_final
+            frac = self.config.temperature_anneal_fraction
+            anneal_iters = int(max_iters * frac)
 
+            if sched == 'constant':
+                T = T0
+            elif sched == 'linear':
+                alpha = min(iter_num, anneal_iters) / anneal_iters
+                T = T0 + (T1 - T0) * alpha
+            elif sched == 'exponential':
+                # geometric interpolation: T = T0 * (T1/T0)^(alpha)
+                alpha = min(iter_num, anneal_iters) / anneal_iters
+                T = T0 * ((T1 / T0) ** alpha)
+            else:
+                raise ValueError(f"Unknown temperature_schedule: {sched}")
+            
+            self.current_temperature = T
+        else:
+            self.current_temperature = self.config.temperature_initial
 
         i = 0      
         while i < self.config.max_router_iter:
+            # Get routing logits based on the router implementation
+            if self.use_router_lstm:
+                # Use the RouterLSTM implementation - no need to pad here as it's handled internally
+                router_logits = self.router(x)  # Shape: [batch_size, seq_len, num_layers]
+                
+                # Apply temperature to logits
+                router_logits = router_logits / self.current_temperature
+            else:
+                # Use original simple LSTM router
+                # Create constant input for LSTM
+                constant_input = torch.ones(batch_size * block_size, 1, 1).to(x.device).to(x.dtype)
+                
+                # Get LSTM output directly as router logits
+                lstm_out, router_state = self.router_lstm(constant_input, router_state)
+                router_logits = lstm_out.squeeze(1)  # Shape: (batch_size * block_size, router_proj_size)
+                router_logits = router_logits.to(x.dtype)  # Ensure consistent dtype
 
-            # Dynamic expert selection
-            padding = torch.zeros(x.shape[0], self.config.block_size - x.shape[1], x.shape[2]).to(x.device).to(x.dtype)
-            x = torch.cat((padding, x), dim=1)
-
-            # x = x[:,:,None,:].repeat(1,1,block_size,1)
-            # x *= causal_mask
-
-            # router_logits, router_state = self.transformer["router"](x.reshape(1, batch_size * block_size, n_embd * block_size), router_state)
-            # router_logits = self.router_linear(router_logits.squeeze(0))
-
-            router_logits = self.router_linear(x.reshape(batch_size * block_size, n_embd))
-
+            # Compute routing weights with softmax
             routing_weights = F.softmax(router_logits, dim=-1, dtype=x.dtype)
 
-            # Tensor dimensions:
-            # x: (batch_size, block_size, block_size, n_embd)
-            # router_state: (n_LSTM_layer, batch_size * block_size, LSTM_hidden_size)
-            # router_logits: (1, batch_size * block_size, router_proj_size)
-            # routing_weights: (batch_size * block_size, router_proj_size)
-            
-            if return_routing_weights:
-                routing_weights_list.append(routing_weights.reshape(batch_size, block_size, -1))
+            # Collect stats for wandb logging
+            if should_log:
+                router_stats.update({
+                    f'router/iter_{i}/logits_mean': router_logits.mean().item(),
+                    f'router/iter_{i}/logits_std': router_logits.std().item(),
+                    f'router/iter_{i}/logits_min': router_logits.min().item(),
+                    f'router/iter_{i}/logits_max': router_logits.max().item(),
+                    f'router/iter_{i}/weights_mean': routing_weights.mean().item(),
+                    f'router/iter_{i}/weights_std': routing_weights.std().item(),
+                    f'router/temperature': self.current_temperature
+                })
 
+            if return_routing_weights:
+                routing_weights_list.append(routing_weights.reshape(batch_size, seq_len, -1)[:, :seq_len, :])
 
             if self.config.open_choice:
                 assert self.config.weigh_experts, "Open choice requires weighing the experts."
-                routing_weights, selected_experts = torch.topk(routing_weights, self.config.expert_k, dim=-1)
-                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-                # Cast back to the input dtype
-                routing_weights = routing_weights.to(x.dtype)
-
-                output = torch.zeros(
-                    (batch_size * block_size, n_embd), dtype=x.dtype, device=x.device
-                )               
-
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)).permute(2, 1, 0)
-    
-                # Tensor dimensions:
-                # selected_experts: (batch_size * block_size, expert_k)
-                # expert_mask: (n_layer + n_identity_layers, expert_k, batch_size * block_size)
-                # routing_weights: (batch_size * block_size, expert_k)
-
-                # x = x.view(batch_size * block_size, block_size, n_embd)
-
-                # Loop over all available experts in the model and perform the computation on each expert
-                for expert_idx in range(self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)):
-                    expert_layer = None if expert_idx >= self.config.n_layer and self.config.identity_layers else self.transformer.h[expert_idx]
-
-                    expert_dim_ind, example_dim_ind = torch.where(expert_mask[expert_idx])
+                
+                # Define dimensions
+                B, L = batch_size, seq_len
+                K = self.config.expert_k
+                C = self.config.n_layer + (self.config.expert_k if self.config.identity_layers else 0)
+                D = n_embd
+                
+                # Get top-k experts and their weights
+                flat_x = x.contiguous().view(B * L, -1)  # [B*L, D]
+                routing_weights_flat, selected_experts_flat = torch.topk(routing_weights.contiguous().view(B * L, -1), K, dim=-1)  # [B*L, K]
+                # Add epsilon for numerical stability
+                routing_weights_flat /= (routing_weights_flat.sum(dim=-1, keepdim=True) + 1e-8)
+                routing_weights_flat = routing_weights_flat.to(x.dtype)
+                
+                # Create expert mask
+                mask = F.one_hot(selected_experts_flat, num_classes=C)  # [B*L, K, C]
+                mask = mask.permute(2, 1, 0)  # [C, K, B*L]
+                
+                # Initialize output buffer
+                output = torch.zeros(B * L, D, device=x.device, dtype=x.dtype)
+                
+                # Process each expert
+                for expert_idx in range(C):
+                    # Find positions where this expert was selected
+                    slot_idx, example_idx = torch.where(mask[expert_idx])  # both [N] where N is number of selections
                     
-                    # Tensors:
-                    # expert_dim_ind: (n_expert_selections) - The kth info for which expert_idx is selected
-                    # example_dim_ind: (n_expert_selections) - The indices of the batch_size * block_size dimension where the expert is selected
-
-                    if len(expert_dim_ind) > 0:
-                        # if expert_layer is None:
-                        #     current_x = x[example_dim_ind]
-                        # else:
-                        #     current_x = expert_layer(x[example_dim_ind])
-
-                        # # Tensor dimensions:
-                        # # current_x: (n_expert_selections, block_size, n_embd)
-                        # # routing_weights: (batch_size * block_size, expert_k)
-
-                        # print("slow", current_x.shape)
-
-                        # current_x *= routing_weights[example_dim_ind, expert_dim_ind, None, None]
-                        
-                        # # Now we select the token to update for each example
-                        # current_x = current_x[torch.arange(current_x.shape[0]), token_arange[example_dim_ind]]
-
-                        # # Accumulate the outputs
-                        # output.index_add_(0, example_dim_ind, current_x.to(x.dtype))
-
-                        # slow_contribution = torch.zeros_like(output)
-                        # slow_contribution.index_add_(0, example_dim_ind, current_x.to(x.dtype))
-
-                        # We can make the computation faster by calling the expert layer once
-                        if expert_layer is None:
-                            current_x = x[:,:,None,:].repeat(1,1,block_size,1).reshape(batch_size * block_size, block_size, n_embd)[example_dim_ind]
+                    if len(slot_idx) > 0:  # Only process if expert was selected
+                        # Get expert outputs
+                        if expert_idx >= self.config.n_layer and self.config.identity_layers:
+                            # Identity expert - just pass through the input
+                            expert_out = flat_x[example_idx]
                         else:
-                            current_x = expert_layer(x)
-                            # print("fast", current_x.shape)
-                            current_x = current_x[:,:,None,:].repeat(1,1,block_size,1).reshape(batch_size * block_size, block_size, n_embd)[example_dim_ind]
-                            # print("fast", current_x.shape)
-                            
-                        current_x *= routing_weights[example_dim_ind, expert_dim_ind, None, None]
+                            # Regular transformer layer
+                            expert_out = self.transformer.h[expert_idx](x).contiguous().view(B * L, -1)[example_idx]
                         
-                        # Now we select the token to update for each example
-                        current_x = current_x[torch.arange(current_x.shape[0]), token_arange[example_dim_ind]]
-                            
-                        # Accumulate the outputs
-                        output.index_add_(0, example_dim_ind, current_x.to(x.dtype))
-                        
-                        # # fast_contribution = torch.zeros_like(output)
-                        # slow_contribution.index_add_(0, example_dim_ind, current_x.to(x.dtype))
-
-                        # # We now check that the computation is correct
-                        # print(expert_layer is not None, torch.allclose(fast_contribution, slow_contribution))
-
-                        # # Now print mse between the two
-                        # print(torch.nn.functional.mse_loss(fast_contribution, slow_contribution))
-
-                output = output.view(batch_size, block_size, n_embd)
+                        # Weight by routing weights and accumulate
+                        output.index_add_(
+                            0,
+                            example_idx,
+                            expert_out * routing_weights_flat[example_idx, slot_idx, None]
+                        )
+                
+                # Reshape output back to [B, L, D]
+                output = output.view(B, L, D)
 
                 router_logits_tuple += (router_logits,)
 
             else:
-
-                # Cast back to the input dtype
-                routing_weights = routing_weights.to(x.dtype)
-
+                routing_weights = routing_weights.contiguous().view(-1, 1, 1)
                 output = torch.zeros_like(x)
-
-                # Tensor dimensions:
-                
                 
                 for expert_i, expert_idx in enumerate(range(i * (self.config.expert_k + (1 if self.config.identity_layers else 0)), (i + 1) * (self.config.expert_k + (1 if self.config.identity_layers else 0)))):
 
@@ -591,23 +666,33 @@ class GW_GPT(GPT):
                     else:
                         expert_layer = self.transformer.h[expert_idx]
                         current_x = expert_layer(x)
+                        current_x = current_x.to(x.dtype)  # Ensure consistent dtype
+                    
                     if self.config.weigh_experts:
                         current_x = current_x * routing_weights[:, expert_i].view(-1, 1, 1) # Weight the outputs
                     else:
                         current_x = current_x / (self.config.expert_k + (1 if self.config.identity_layers else 0)) # Average the outputs
 
-                    # Accumulate the outputs
                     output += current_x
 
-            x = output
-            outputs.append(self.transformer.ln_f(output)) 
-            
-
+            # Optionally normalize the mixture before the next iteration
+            post_mix = self.transformer.ln_f(output) if self.config.normalize_residual_stream else output
+            outputs.append(post_mix)  # Store normalized output for loss/analysis
+            x = post_mix
             i += 1
             
         x = self.transformer.ln_f(x)
         
         logits, loss = self.post_blocks_forward(x, targets, intermediate_outputs=outputs, router_logits=router_logits_tuple)
+
+        # Log router stats to wandb if available
+        if should_log and 'wandb' in sys.modules:
+            import wandb
+            wandb.log(router_stats, step=self.forward_counter)
+
+        # Increment counter
+        if hasattr(self, 'forward_counter'):
+            self.forward_counter += 1
 
         if return_routing_weights:
             routing_weights_list = torch.stack(routing_weights_list, dim=1)

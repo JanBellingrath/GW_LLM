@@ -1,7 +1,7 @@
-
 import numpy as np
 import torch
 import os
+import time
 
 import wandb
 
@@ -178,20 +178,64 @@ run_configuration = {
 # }
 
 def main():
+    try:
+        run = wandb.init(
+            project="GW_LLM",
+            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+        )
+        
+        try:
+            loss = objective(wandb.config, save_checkpoint=False)
+            wandb.log({"loss": loss})
+        except Exception as e:
+            print(f"Error during run execution: {str(e)}")
+            # Log the error to wandb
+            wandb.log({"error": str(e), "status": "failed"})
+            # Return a very high loss value to indicate failure
+            return float('inf')
+        finally:
+            # Ensure we clean up even if there's an error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+    except Exception as e:
+        print(f"Error during wandb initialization: {str(e)}")
+        return float('inf')
 
-    run = wandb.init(
-        project="GW_LLM",
-        sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-    )
-    # loss, done_when = objective(wandb.config)
-    loss = objective(wandb.config, save_checkpoint=False)
-    wandb.log({"loss": loss})
-    # wandb.log({"done_when": done_when})
-
+def run_sweep():
+    """Wrapper function to handle sweep execution with error handling"""
+    def wrapped_main():
+        try:
+            return main()
+        except Exception as e:
+            print(f"Unhandled exception in sweep run: {str(e)}")
+            return float('inf')
+    
+    return wrapped_main
 
 if __name__ == "__main__":
     sweep_id = [None, "yilwx8g5", "52voc92u", "het0u5tt", "e8mjkq03", "qum883k6"][-1]
     if sweep_id is None:
-        sweep_id = wandb.sweep(sweep=run_configuration, project="GW_LLM")
+        try:
+            sweep_id = wandb.sweep(config=run_configuration, project="GW_LLM", entity="cerco_neuro_ai")
+        except Exception as e:
+            print(f"Failed to create sweep: {str(e)}")
+            exit(1)
+    
     count = 1000
-    wandb.agent(sweep_id, function=main, count=count, project="GW_LLM")
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            wandb.agent(sweep_id, function=run_sweep(), count=count, project="GW_LLM")
+            break  # If successful, break out of retry loop
+        except Exception as e:
+            retry_count += 1
+            print(f"Sweep agent failed (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count < max_retries:
+                print("Retrying in 60 seconds...")
+                time.sleep(60)
+            else:
+                print("Max retries reached. Exiting.")
+                break
